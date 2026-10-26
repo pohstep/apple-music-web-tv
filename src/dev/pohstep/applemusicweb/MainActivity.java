@@ -16,7 +16,14 @@ import android.graphics.RadialGradient;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.media.MediaMetadata;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.net.Uri;
+import android.util.LruCache;
 import android.text.Layout;
 import android.text.StaticLayout;
 import android.text.TextPaint;
@@ -94,6 +101,21 @@ public class MainActivity extends Activity {
     private String lyricKey = "";
     private boolean resumed;
 
+    // v2.2: system media session (so a launcher / other apps can show and control playback)
+    static volatile MainActivity instance;
+    private static final String CONTROL_ACTION = "dev.pohstep.applemusicweb.CONTROL";
+    private MediaSession session;
+    private boolean sessionActive, svcRunning;
+    private String sTitle = "", sArtist = "", sAlbum = "", sArtUrl = "";
+    private long sDurMs = -1;
+    private int sState = -1;           // PlaybackState.STATE_*
+    private long sPosMs = -1, sPosAt;  // last position we told the session, and when (elapsedRealtime)
+    private float sRate = 1f;
+    private long notPlayingSince;
+    private final LruCache<String, Bitmap> artCache = new LruCache<>(4);
+    private String sArtLoading = "";
+    private BroadcastReceiver controlReceiver;
+
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
             if (!(up || down || left || right)) return;
@@ -136,6 +158,7 @@ public class MainActivity extends Activity {
             cy = root.getHeight() / 2f;
             cursor.invalidate();
         });
+        initSession();
         if (b != null) main.restoreState(b); else main.loadUrl(HOME);
     }
 
@@ -623,7 +646,7 @@ public class MainActivity extends Activity {
     private final Runnable poll = new Runnable() {
         @Override public void run() {
             handler.removeCallbacks(this);
-            if (resumed) handler.postDelayed(this, 1000);
+            if (resumed || sessionActive) handler.postDelayed(this, 1000);
             if (main == null) return;
             String known = lyricKey.replaceAll("[^A-Za-z0-9._-]", "");
             main.evaluateJavascript("window.__amw?__amw.state('" + known + "'):null", v -> onState(v));
@@ -662,6 +685,7 @@ public class MainActivity extends Activity {
                 play.setLyrics(null, null, null);
             }
             play.update(o);
+            publish(o);
         } catch (Exception e) { }
     }
 
@@ -707,7 +731,9 @@ public class MainActivity extends Activity {
         + " for(var i=0;i<med.length;i++){var m=med[i];if(playing){if(!m.paused)m.pause();}else if(m.src||m.currentSrc){m.play();}}return 'media';}"
         + "var re=mode==='next'?/^next/i:/^(previous|back)/i;"
         + "var b=els.filter(function(e){var l=(e.getAttribute&&(e.getAttribute('aria-label')||e.getAttribute('title')))||'';"
-        + " return (e.tagName==='BUTTON'||e.getAttribute('role')==='button')&&re.test(l.trim())&&e.getBoundingClientRect().width>0;});"
+        + " var cn=(e.className&&e.className.toString())||'';"
+        + " var byCls=e.tagName==='BUTTON'&&(mode==='next'?/button--next/:/button--previous/).test(cn);"
+        + " return (byCls||((e.tagName==='BUTTON'||e.getAttribute('role')==='button')&&re.test(l.trim())))&&e.getBoundingClientRect().width>0;});"
         + "if(b.length){b[0].click();return 'btn';}return 'none';})()";
 
     private void media(int code) {
@@ -722,6 +748,201 @@ public class MainActivity extends Activity {
         }
         // Playback lives in the main page (popups are only for sign-in).
         main.evaluateJavascript(JS_TOGGLE.replace("%MODE%", mode), null);
+        if (code == KeyEvent.KEYCODE_MEDIA_NEXT || code == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
+            // Skipping must keep playing: if the page lands on the new track paused, press play.
+            final String playJs = JS_TOGGLE.replace("%MODE%", "play");
+            for (int d : new int[]{1200, 2500, 4500}) {
+                handler.postDelayed(() -> main.evaluateJavascript(playJs, null), d);
+            }
+        }
+    }
+
+
+    // ---------- v2.2: MediaSession + control ----------
+
+    private void initSession() {
+        instance = this;
+        try {
+            session = new MediaSession(this, "AppleMusicWeb");
+            session.setCallback(new MediaSession.Callback() {
+                @Override public void onPlay() { media(KeyEvent.KEYCODE_MEDIA_PLAY); }
+                @Override public void onPause() { media(KeyEvent.KEYCODE_MEDIA_PAUSE); }
+                @Override public void onStop() { media(KeyEvent.KEYCODE_MEDIA_PAUSE); }
+                @Override public void onSkipToNext() { media(KeyEvent.KEYCODE_MEDIA_NEXT); }
+                @Override public void onSkipToPrevious() { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); }
+                @Override public void onSeekTo(long pos) { seekTo(pos); }
+            });
+            session.setSessionActivity(android.app.PendingIntent.getActivity(this, 0,
+                    new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    android.app.PendingIntent.FLAG_IMMUTABLE));
+        } catch (Exception e) { session = null; }
+        // Implicit broadcasts only reach runtime-registered receivers on Android 8+; the manifest
+        // receiver (ControlReceiver) covers explicit "-n" broadcasts.
+        controlReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context c, Intent i) { control(i.getStringExtra("cmd")); }
+        };
+        try { registerReceiver(controlReceiver, new IntentFilter(CONTROL_ACTION)); } catch (Exception e) { controlReceiver = null; }
+    }
+
+    /** cmd = play | pause | toggle | next | prev. Same script paths as the hardware media keys. */
+    void control(final String cmd) {
+        if (cmd == null) return;
+        handler.post(() -> {
+            switch (cmd.trim().toLowerCase(Locale.US)) {
+                case "play": media(KeyEvent.KEYCODE_MEDIA_PLAY); break;
+                case "pause": media(KeyEvent.KEYCODE_MEDIA_PAUSE); break;
+                case "toggle": media(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE); break;
+                case "next": media(KeyEvent.KEYCODE_MEDIA_NEXT); break;
+                case "prev": case "previous": media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); break;
+            }
+        });
+    }
+
+    private static final String JS_SEEK =
+        "(function(){var p=%POS%;try{var mk=window.MusicKit&&MusicKit.getInstance&&MusicKit.getInstance();"
+        + "if(mk&&mk.seekToTime){mk.seekToTime(p);return 'mk';}}catch(x){}"
+        + "function all(r,o){var m=r.querySelectorAll('*');for(var i=0;i<m.length;i++){o.push(m[i]);if(m[i].shadowRoot)all(m[i].shadowRoot,o);}return o;}"
+        + "var els=all(document,[]);for(var i=0;i<els.length;i++){var e=els[i];if((e.tagName==='AUDIO'||e.tagName==='VIDEO')&&(e.src||e.currentSrc)){e.currentTime=p;return 'media';}}return 'none';})()";
+
+    private void seekTo(long posMs) {
+        if (main == null || posMs < 0) return;
+        main.evaluateJavascript(JS_SEEK.replace("%POS%", String.valueOf(posMs / 1000.0)), null);
+        sPosMs = posMs; sPosAt = SystemClock.elapsedRealtime();
+        pushState(sState < 0 ? PlaybackState.STATE_PAUSED : sState);
+    }
+
+    private void publish(JSONObject o) {
+        if (session == null) return;
+        String t = o.optString("t", ""), a = o.optString("a", ""), al = o.optString("al", "");
+        String ps = o.optString("ps", "none");
+        boolean has = !"none".equals(ps) && !(t.isEmpty() && a.isEmpty());
+        if (!has) {
+            if (sessionActive) {
+                try { session.setActive(false); } catch (Exception e) { }
+                sessionActive = false;
+                sState = -1; sTitle = sArtist = sAlbum = sArtUrl = ""; sDurMs = -1;
+            }
+            return;
+        }
+        long durMs = o.has("dur") && o.optDouble("dur", -1) > 0 ? (long) (o.optDouble("dur") * 1000) : -1;
+        String u = o.optString("art", "");
+        if (u.contains("mzstatic.com")) u = u.replaceAll("/\\d+x\\d+([a-z]{0,3})\\.(jpg|jpeg|png|webp)$", "/600x600$1.$2");
+        boolean metaChanged = !t.equals(sTitle) || !a.equals(sArtist) || !al.equals(sAlbum)
+                || durMs != sDurMs || !u.equals(sArtUrl);
+        sTitle = t; sArtist = a; sAlbum = al; sDurMs = durMs; sArtUrl = u;
+        if (metaChanged) {
+            pushMetadata();
+            if (!u.isEmpty() && artCache.get(u) == null) fetchSessionArt(u);
+        }
+        boolean playing = "playing".equals(ps);
+        int st = playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED;
+        long posMs = o.has("pos") && o.optDouble("pos", -1) >= 0 ? (long) (o.optDouble("pos") * 1000) : -1;
+        float rate = (float) o.optDouble("rate", 1);
+        if (rate <= 0 || Float.isNaN(rate)) rate = 1f;
+        long now = SystemClock.elapsedRealtime();
+        boolean push = st != sState || metaChanged || rate != sRate;
+        if (!push && posMs >= 0 && sPosMs >= 0) {
+            long expected = sPosMs + (sState == PlaybackState.STATE_PLAYING ? (long) ((now - sPosAt) * sRate) : 0);
+            if (Math.abs(posMs - expected) > 1500) push = true;
+        }
+        if (push) {
+            sRate = rate;
+            if (posMs >= 0) { sPosMs = posMs; sPosAt = now; }
+            pushState(st);
+        }
+        if (!sessionActive) {
+            try { session.setActive(true); sessionActive = true; } catch (Exception e) { }
+        }
+        // Keep the process alive while the launcher (or anything else) is in front.
+        if (playing) { notPlayingSince = 0; startService(); }
+        else {
+            if (notPlayingSince == 0) notPlayingSince = now;
+            if (svcRunning && now - notPlayingSince > 20 * 60 * 1000L) stopService();
+        }
+    }
+
+    private void pushMetadata() {
+        if (session == null) return;
+        MediaMetadata.Builder mb = new MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, sTitle)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, sArtist)
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, sAlbum)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, sTitle)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, sArtist);
+        if (sDurMs > 0) mb.putLong(MediaMetadata.METADATA_KEY_DURATION, sDurMs);
+        Bitmap bm = sArtUrl.isEmpty() ? null : artCache.get(sArtUrl);
+        if (bm != null) {
+            mb.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bm);
+            mb.putBitmap(MediaMetadata.METADATA_KEY_ART, bm);
+            mb.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, bm);
+        }
+        try { session.setMetadata(mb.build()); } catch (Exception e) { }
+    }
+
+    private void pushState(int st) {
+        if (session == null) return;
+        sState = st;
+        long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
+                | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SEEK_TO;
+        long pos = sPosMs >= 0 ? sPosMs : PlaybackState.PLAYBACK_POSITION_UNKNOWN;
+        try {
+            session.setPlaybackState(new PlaybackState.Builder().setActions(actions)
+                    .setState(st, pos, st == PlaybackState.STATE_PLAYING ? sRate : 0f, sPosAt == 0 ? SystemClock.elapsedRealtime() : sPosAt)
+                    .build());
+        } catch (Exception e) { }
+    }
+
+    private void fetchSessionArt(final String u) {
+        if (u.equals(sArtLoading)) return;
+        sArtLoading = u;
+        new Thread(() -> {
+            Bitmap bm = null;
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                c.setConnectTimeout(8000); c.setReadTimeout(8000);
+                InputStream in = c.getInputStream();
+                Bitmap full = BitmapFactory.decodeStream(in);
+                in.close();
+                if (full != null) {
+                    int w = full.getWidth(), h = full.getHeight(), m = Math.max(w, h);
+                    bm = m > 600 ? Bitmap.createScaledBitmap(full, Math.max(1, w * 600 / m), Math.max(1, h * 600 / m), true) : full;
+                }
+            } catch (Exception e) { }
+            final Bitmap res = bm;
+            handler.post(() -> {
+                if (res != null) {
+                    artCache.put(u, res);
+                    if (u.equals(sArtUrl)) pushMetadata();
+                } else {
+                    sArtLoading = ""; // retried on the next metadata change
+                }
+                if (res != null) sArtLoading = "";
+            });
+        }).start();
+    }
+
+    private void startService() {
+        if (svcRunning) return;
+        try {
+            startForegroundService(new Intent(this, PlaybackService.class));
+            svcRunning = true;
+        } catch (Exception e) { }
+    }
+
+    private void stopService() {
+        try { stopService(new Intent(this, PlaybackService.class)); } catch (Exception e) { }
+        svcRunning = false;
+    }
+
+    private void releaseSession() {
+        if (instance == this) instance = null;
+        if (controlReceiver != null) { try { unregisterReceiver(controlReceiver); } catch (Exception e) { } controlReceiver = null; }
+        sessionActive = false;
+        if (session != null) {
+            try { session.setActive(false); session.release(); } catch (Exception e) { }
+            session = null;
+        }
+        stopService();
     }
 
     @Override protected void onResume() {
@@ -733,7 +954,7 @@ public class MainActivity extends Activity {
     @Override protected void onPause() {
         super.onPause();
         resumed = false;
-        handler.removeCallbacks(poll);
+        if (!sessionActive) handler.removeCallbacks(poll);
         CookieManager.getInstance().flush();
         dirKey(KeyEvent.KEYCODE_DPAD_UP, false); up = down = left = right = false;
         handler.removeCallbacks(ticker);
@@ -742,6 +963,8 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         handler.removeCallbacks(ticker);
+        handler.removeCallbacks(poll);
+        releaseSession();
         super.onDestroy();
     }
 

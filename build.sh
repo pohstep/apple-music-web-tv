@@ -22,7 +22,7 @@ AJ="$ANDROID_HOME/platforms/${PLATFORM:-android-31}/android.jar"
 KEYSTORE="${KEYSTORE:-debug.keystore}"
 KS_PASS="${KS_PASS:-android}"
 KS_ALIAS="${KS_ALIAS:-androiddebugkey}"
-OUT="apple-music-web-2.1.apk"
+OUT="apple-music-web-2.2.2.apk"
 
 # Create a debug keystore on first run (never commit it; it is git-ignored).
 if [ ! -f "$KEYSTORE" ]; then
@@ -34,10 +34,10 @@ fi
 rm -rf build && mkdir -p build/classes build/dex
 "$BT/aapt2" compile --dir res -o build/res.zip
 "$BT/aapt2" link -o build/base.apk -I "$AJ" --manifest AndroidManifest.xml \
-  --min-sdk-version 26 --target-sdk-version 31 --version-code 4 --version-name 2.1 \
+  --min-sdk-version 26 --target-sdk-version 31 --version-code 7 --version-name 2.2.2 \
   --java build/gen build/res.zip
 javac -source 8 -target 8 -Xlint:-options -cp "$AJ" -d build/classes \
-  build/gen/dev/pohstep/applemusicweb/R.java src/dev/pohstep/applemusicweb/MainActivity.java
+  build/gen/dev/pohstep/applemusicweb/R.java src/dev/pohstep/applemusicweb/*.java
 "$BT/d8" --min-api 26 --lib "$AJ" --output build/dex $(find build/classes -name '*.class')
 cp build/base.apk build/unsigned.apk
 python3 - <<'PY'

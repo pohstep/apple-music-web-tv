@@ -12,12 +12,12 @@ Requirements: Android 8.0+ (API 26), system WebView, Widevine DRM, an Apple Musi
 
 ## Install
 
-Download `apple-music-web-2.1.apk` and its `.sha256` from the [Releases](../../releases) page, check the hash, then:
+Download `apple-music-web-2.2.2.apk` and its `.sha256` from the [Releases](../../releases) page, check the hash, then:
 
 ```
-sha256sum -c apple-music-web-2.1.apk.sha256
+sha256sum -c apple-music-web-2.2.2.apk.sha256
 adb connect <TV-IP>:5555
-adb install apple-music-web-2.1.apk
+adb install apple-music-web-2.2.2.apk
 ```
 
 Open "Apple Music Web" from the TV's app list and sign in on Apple's own page.
@@ -41,6 +41,19 @@ A dim now-playing screen for background listening: album art, title, artist, pro
 
 Lyrics are best-effort: they appear only if Apple's page exposes timed lyrics for the current song.
 
+## Background playback and control (v2.2+)
+
+- **Media session:** the app publishes a real Android media session, so the system now-playing UI (and launchers that read active media sessions) can show the current song and send previous / play-pause / next.
+- **Foreground service:** a media-playback service keeps music playing when you leave the app.
+- **adb control broadcast:** `adb shell am broadcast -a dev.pohstep.applemusicweb.CONTROL -n dev.pohstep.applemusicweb/.ControlReceiver --es cmd next` (cmd: `play`, `pause`, `toggle`, `next`, `prev`).
+
+## Changelog
+
+- **2.2.2** - Next and previous keep playing instead of leaving the player paused.
+- **2.2.1** - Fixes the next/previous buttons: they are now found by class, so they work in a non-English Apple Music UI.
+- **2.2** - Media session, foreground playback service, adb control broadcast.
+- **2.1** - Cursor mode as the default, sign-in popups in a child WebView.
+
 ## Build from source
 
 Needs JDK 17 and the Android SDK (build-tools 34.0.0, platform android-31).
@@ -51,7 +64,7 @@ export ANDROID_HOME=/path/to/android-sdk
 ./build.sh
 ```
 
-The script creates a local `debug.keystore` on first run (it is git-ignored; do not commit it), builds, signs and verifies `apple-music-web-2.1.apk`, and writes its `.sha256`. To make the keystore yourself:
+The script creates a local `debug.keystore` on first run (it is git-ignored; do not commit it), builds, signs and verifies `apple-music-web-2.2.2.apk`, and writes its `.sha256`. To make the keystore yourself:
 
 ```
 keytool -genkeypair -keystore debug.keystore -storepass android -keypass android \
